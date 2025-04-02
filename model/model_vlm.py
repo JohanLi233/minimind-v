@@ -8,6 +8,36 @@ import torch
 
 warnings.filterwarnings('ignore')
 
+class DynamicTanh(nn.Module):
+    """
+    实现 Dynamic Tanh (DyT) 层，作为 Normalization 层的替代方案。
+    DyT(x) = γ * tanh(αx) + β
+    """
+    def __init__(self, dim: int, alpha):
+        """
+        初始化 DyT 层。
+
+        参数:
+            dim (int): 输入特征的维度 (对应 Norm 层中的 dim 或 normalized_shape[-1])。
+            init_a (float): 可学习标量 alpha 的初始值。默认为 0.5。
+        """
+        super().__init__()
+        self.dim = dim
+        # 可学习的标量 alpha
+        self.alpha = nn.Parameter(torch.ones(1) * alpha)
+        # 可学习的逐通道缩放 gamma (γ)，初始化为 1
+        self.gamma = nn.Parameter(torch.ones(dim))
+        # 可学习的逐通道平移 beta (β)，初始化为 0
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        DyT 的前向传播。
+        期望 x 的形状是 (..., dim)。
+        """
+        # alpha (标量) 会自动广播
+        # gamma 和 beta (形状 dim) 会自动广播到 x 的最后一个维度
+        return self.gamma * torch.tanh(self.alpha * x) + self.beta
 
 class VisionProj(nn.Module):
     def __init__(self, ve_dim=768, lm_dim=512):
@@ -15,7 +45,9 @@ class VisionProj(nn.Module):
         self.ve_dim = ve_dim
         self.lm_dim = lm_dim
         self.vision_proj = nn.Sequential(
-            nn.Linear(self.ve_dim, self.lm_dim)
+            nn.Linear(ve_dim, lm_dim),  # 维度对齐
+            # nn.GELU(),
+            DynamicTanh(lm_dim, 0.15)  # 动态 tanh 归一化
         )
 
     def forward(self, image_encoders):

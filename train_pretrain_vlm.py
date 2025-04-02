@@ -98,20 +98,32 @@ def train_epoch(epoch, wandb):
             model.train()
 
 
-def init_model(model_config: VLMConfig):
+def init_model(model_config: VLMConfig, from_pretrain=None):
     tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')
     moe_path = '_moe' if model_config.use_moe else ''
-    # 加载纯语言模型权重
-    ckp = f'./out/lm_{model_config.dim}{moe_path}.pth'
     model = MiniMindVLM(model_config)
-    state_dict = torch.load(ckp, map_location=args.device)
-    model.load_state_dict(state_dict, strict=False)
+    
+    if from_pretrain:
+        # 加载预训练模型
+        state_dict = torch.load(from_pretrain, map_location=args.device)
+        # 处理可能的 DDP 前缀（如果模型是用分布式训练保存的）
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=False)
+        Logger(f"Loaded pretrained VLM model from {from_pretrain}")
+    else:
+        # 加载纯语言模型权重
+        ckp = f'./out/lm_{model_config.dim}{moe_path}.pth'
+        state_dict = torch.load(ckp, map_location=args.device)
+        model.load_state_dict(state_dict, strict=False)
+        Logger(f"Loaded language model from {ckp}")
 
     # 冻结除 vision_proj 外的所有参数
     for name, param in model.named_parameters():
         if 'vision_proj' not in name:
             param.requires_grad = False
-    # 可训练
+
+    # 允许最后几层训练
     if hasattr(model, "layers"):
         last_two_layers = model.layers[-1:]
         for layer in last_two_layers:
@@ -138,6 +150,7 @@ def init_distributed_mode():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind-V Pretrain")
+    parser.add_argument('--from_pretrain', type=str, default=None, help='Path to pretrained VLM model checkpoint')
     parser.add_argument("--out_dir", type=str, default="out")
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -187,7 +200,7 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer, preprocess = init_model(model_config)
+    model, tokenizer, preprocess = init_model(model_config, args.from_pretrain)
 
     train_ds = VLMDataset(args.data_path, args.images_path, tokenizer, preprocess=preprocess,
                           image_special_token=model_config.image_special_token,

@@ -1,17 +1,215 @@
-import math
-import struct
-import inspect
-import time
-
 from .LMConfig import LMConfig
-from typing import Any, Optional, Tuple, List
-import numpy as np
+
+import math
+from typing import Optional, Tuple, List
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+class MLAttention(nn.Module):
+    """
+    Multi-Head Latent Attention (MLA) block - Corrected GQA Handling.
+    """
+    def __init__(self, args: LMConfig):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # Ensure n_kv_heads divides n_heads for GQA
+        if self.n_heads % self.n_kv_heads != 0:
+             raise ValueError(f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})")
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = args.dim // args.n_heads
+        # MLA specific dimensions
+        self.kv_latent_dim = args.kv_latent_dim
+        self.q_latent_dim = args.q_latent_dim
+
+        # Validate config attributes
+        if not hasattr(args, 'kv_latent_dim') or args.kv_latent_dim is None:
+             raise ValueError("LMConfig must include valid kv_latent_dim for MLAttention")
+        if not hasattr(args, 'q_latent_dim') or args.q_latent_dim is None:
+             raise ValueError("LMConfig must include valid q_latent_dim for MLAttention")
+        if not hasattr(args, 'max_seq_len') or args.max_seq_len is None:
+            raise ValueError("LMConfig must include max_seq_len for MLAttention mask")
+        if not hasattr(args, 'rope_theta') or args.rope_theta is None:
+            args.rope_theta = 10000.0 # Default value if missing
+            print(f"Warning: rope_theta not found in LMConfig, defaulting to {args.rope_theta}")
+
+
+        # --- MLA Projection Layers ---
+        self.w_dkv = nn.Linear(args.dim, self.kv_latent_dim, bias=False)
+        self.w_uk = nn.Linear(self.kv_latent_dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.w_kr = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.w_uv = nn.Linear(self.kv_latent_dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.w_dq = nn.Linear(args.dim, self.q_latent_dim, bias=False)
+        self.w_uq = nn.Linear(self.q_latent_dim, self.n_heads * self.head_dim, bias=False)
+        self.w_qr = nn.Linear(self.q_latent_dim, self.n_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, args.dim, bias=False) # Output projection matches V shape
+
+        # --- Standard Components ---
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and getattr(args, 'flash_attn', False) # Safely check flash_attn
+        self.dropout = args.dropout
+
+        # Causal mask buffer
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask, persistent=False)
+
+        # Dimension per head for K after concatenation (used for scaling)
+        self.k_concat_head_dim = 2 * self.head_dim
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        pos_cis: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+
+        bsz, seq_len, _ = x.shape
+
+        # --- Query Path ---
+        c_q = self.w_dq(x)
+        q_u = self.w_uq(c_q).view(bsz, seq_len, self.n_heads, self.head_dim)
+        q_r_pre_rope = self.w_qr(c_q).view(bsz, seq_len, self.n_heads, self.head_dim)
+        q_r, _ = apply_rotary_emb(q_r_pre_rope, torch.zeros_like(q_r_pre_rope), pos_cis=pos_cis)
+        xq = torch.cat([q_u, q_r], dim=-1) # Shape: [bsz, seq_len, n_heads, 2 * head_dim]
+
+        # --- Key/Value Path ---
+        c_kv_current = self.w_dkv(x)
+        k_r_pre_rope_current = self.w_kr(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        _, k_r_current = apply_rotary_emb(torch.zeros_like(k_r_pre_rope_current), k_r_pre_rope_current, pos_cis=pos_cis)
+
+        if past_key_value is not None:
+            past_c_kv, past_k_r = past_key_value
+            c_kv = torch.cat([past_c_kv, c_kv_current], dim=1)
+            k_r = torch.cat([past_k_r, k_r_current], dim=1)
+        else:
+            c_kv = c_kv_current
+            k_r = k_r_current
+
+        k_u = self.w_uk(c_kv).view(bsz, -1, self.n_kv_heads, self.head_dim)
+        v_u = self.w_uv(c_kv).view(bsz, -1, self.n_kv_heads, self.head_dim)
+
+        mla_cache = (c_kv, k_r) if use_cache else None
+
+        # Concatenate K components
+        xk = torch.cat([k_u, k_r], dim=-1) # Shape: [bsz, total_seq_len, n_kv_heads, 2 * head_dim]
+        # V component (NO concatenation)
+        xv = v_u                         # Shape: [bsz, total_seq_len, n_kv_heads, head_dim]
+
+        # --- GQA Expansion ---
+        # Repeat K/V heads AFTER all K/V components are computed and concatenated/selected
+        # Input shapes to repeat_kv:
+        # xk: [bsz, total_seq_len, n_kv_heads, 2 * head_dim]
+        # xv: [bsz, total_seq_len, n_kv_heads, head_dim]
+        xk = repeat_kv(xk, self.n_rep) # Output: [bsz, total_seq_len, n_heads, 2 * head_dim]
+        xv = repeat_kv(xv, self.n_rep) # Output: [bsz, total_seq_len, n_heads, head_dim]
+
+        # --- Attention Calculation ---
+        # Transpose to shape [bsz, n_heads, seq_len/total_seq_len, head_dim_variant]
+        xq = xq.transpose(1, 2) # [bsz, n_heads, seq_len, 2 * head_dim]
+        xk = xk.transpose(1, 2) # [bsz, n_heads, total_seq_len, 2 * head_dim]
+        xv = xv.transpose(1, 2) # [bsz, n_heads, total_seq_len, head_dim]
+
+        query_len = xq.shape[2]
+        key_len = xk.shape[2]
+        current_seq_len = key_len if past_key_value is None else key_len - past_key_value[0].shape[1] # Len of current input
+
+        # Use Flash Attention 2 for training (seq_len == key_len) and potentially generation
+        if self.flash:
+            # Flash Attention requires Pytorch >= 2.0
+            # It automatically handles causal masking when is_causal=True
+            # It also handles GQA broadcasting correctly if K/V have n_kv_heads and Q has n_heads
+            # However, we have already repeated K/V to n_heads, so standard SDPA works.
+            dropout_p = self.dropout if self.training else 0.0
+            # We need a causal mask only when generating tokens one by one and q_len != k_len
+            # But SDPA's is_causal=True handles the standard causal case (q_len == k_len)
+            # For generation (q_len=1), is_causal doesn't apply, but the matmul works correctly.
+            # Let's rely on is_causal for the training case (q_len == k_len == seq_len)
+            is_causal_sdpa = query_len == key_len # Only apply SDPA causal mask if lengths match (training)
+
+            try:
+                 # Use causal mask for training, no mask needed for single-token generation (handled by slicing)
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv,
+                    attn_mask=None, # Masking handled by is_causal or slicing in generation
+                    dropout_p=dropout_p,
+                    is_causal=is_causal_sdpa # Make causal mask conditional
+                )
+            except Exception as e:
+                 # Fallback if SDPA fails for some reason (e.g., specific dtype issue)
+                 print(f"SDPA failed with error: {e}. Falling back to manual attention.")
+                 if query_len == key_len: # Manual causal calculation for training
+                     scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.k_concat_head_dim)
+                     mask_slice = self.mask[:, :, :query_len, :key_len]
+                     scores = scores + mask_slice
+                     scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                     scores = self.attn_dropout(scores)
+                     output = torch.matmul(scores, xv)
+                 else: # Manual calculation for generation (q_len=1)
+                    scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.k_concat_head_dim)
+                    # No causal mask needed here as query_len is 1
+                    scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+                    scores = self.attn_dropout(scores)
+                    output = torch.matmul(scores, xv)
+
+        else:
+            # Manual calculation
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.k_concat_head_dim)
+
+            # Apply causal mask only if needed (standard training case)
+            if query_len == key_len:
+                # Extract the correct slice of the mask
+                # Mask shape is (1, 1, max_seq_len, max_seq_len)
+                # We need mask for current query positions interacting with all key positions
+                mask_slice = self.mask[:, :, :query_len, :key_len]
+                scores = scores + mask_slice
+            # For generation (query_len=1), no causal mask is needed for the scores matrix
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = torch.matmul(scores, xv)  # Shape: [bsz, n_heads, seq_len, head_dim]
+
+        # --- Reshape and Output Projection ---
+        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1) # Shape: [bsz, seq_len, n_heads * head_dim]
+        output = self.resid_dropout(self.wo(output)) # Shape: [bsz, seq_len, dim]
+
+        return output, mla_cache
+
+class DynamicTanh(nn.Module):
+    """
+    实现 Dynamic Tanh (DyT) 层，作为 Normalization 层的替代方案。
+    DyT(x) = γ * tanh(αx) + β
+    """
+    def __init__(self, dim: int, alpha):
+        """
+        初始化 DyT 层。
+
+        参数:
+            dim (int): 输入特征的维度 (对应 Norm 层中的 dim 或 normalized_shape[-1])。
+            init_a (float): 可学习标量 alpha 的初始值。默认为 0.5。
+        """
+        super().__init__()
+        self.dim = dim
+        # 可学习的标量 alpha
+        self.alpha = nn.Parameter(torch.ones(1) * alpha)
+        # 可学习的逐通道缩放 gamma (γ)，初始化为 1
+        self.gamma = nn.Parameter(torch.ones(dim))
+        # 可学习的逐通道平移 beta (β)，初始化为 0
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        DyT 的前向传播。
+        期望 x 的形状是 (..., dim)。
+        """
+        # alpha (标量) 会自动广播
+        # gamma 和 beta (形状 dim) 会自动广播到 x 的最后一个维度
+        return self.gamma * torch.tanh(self.alpha * x) + self.beta
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
@@ -38,7 +236,6 @@ def apply_rotary_emb(xq, xk, pos_cis):
         assert pos_cis.shape == (x.shape[1], x.shape[-1])
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return pos_cis.view(*shape)
-
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     pos_cis = unite_shape(pos_cis, xq_)
@@ -263,11 +460,20 @@ class MiniMindBlock(nn.Module):
         self.n_heads = config.n_heads
         self.dim = config.dim
         self.head_dim = config.dim // config.n_heads
-        self.attention = Attention(config)
+        # MLA
+        self.attention = MLAttention(config)
+        # self.attention = Attention(config)
 
         self.layer_id = layer_id
+
+        # RMSNorm
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
+
+        # DynamicTanh
+        # self.attention_norm = DynamicTanh(config.dim, alpha=config.alpha * 1.5)
+        # self.ffn_norm = DynamicTanh(config.dim, alpha=config.alpha)
+
         self.feed_forward = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, x, pos_cis, past_key_value=None, use_cache=False):
@@ -292,7 +498,11 @@ class MiniMindLM(PreTrainedModel):
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])
+
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+
+        # self.norm = DynamicTanh(params.dim, alpha=params.alpha)
+
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
         self.tok_embeddings.weight = self.output.weight
         self.register_buffer("pos_cis",
